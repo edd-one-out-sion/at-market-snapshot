@@ -1,0 +1,147 @@
+name: daily-snapshot
+
+on:
+  schedule:
+    - cron: '17 17 * * *'  # 02:17 KST
+    - cron: '7 19 * * *'   # 04:07 KST
+    - cron: '7 22 * * *'   # 07:07 KST
+    - cron: '7 3 * * *'    # 12:07 KST
+    - cron: '17 10 * * *'  # 19:17 KST
+    - cron: '7 12 * * *'   # 21:07 KST
+    - cron: '17 14 * * *'  # 23:17 KST
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-snapshot
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Capture settlement window
+        env:
+          AT_CAPTURE_SOURCES: ${{ vars.AT_CAPTURE_SOURCES || 'realtime,origin' }}
+          DATA_GO_KR_API_KEY_ENC: ${{ secrets.DATA_GO_KR_API_KEY_ENC }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          FROM=$(date -u -d '9 hours 5 days ago' +%Y%m%d)
+          TO=$(date -u -d '33 hours' +%Y%m%d)
+          python scripts/capture_snapshot.py "$FROM" "$TO"
+
+      - name: Load into Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python scripts/load_raw_to_db.py
+
+      - name: Backup push to private repository
+        id: backup
+        continue-on-error: true
+        env:
+          BACKUP_PUSH_TOKEN: ${{ secrets.BACKUP_PUSH_TOKEN }}
+          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BACKUP_PUSH_TOKEN:-}" ]; then
+            echo "backup push stopped: BACKUP_PUSH_TOKEN is not configured" >&2
+            exit 1
+          fi
+          if [ -z "${BACKUP_REPO:-}" ]; then
+            echo "backup push stopped: BACKUP_REPO is not configured" >&2
+            exit 1
+          fi
+          if [[ ! "$BACKUP_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "backup push stopped: BACKUP_REPO must use owner/name format" >&2
+            exit 1
+          fi
+
+          repo_metadata=$(curl --fail-with-body --silent --show-error \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $BACKUP_PUSH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$BACKUP_REPO")
+          repo_private=$(printf '%s' "$repo_metadata" | python -c \
+            'import json, sys; print("true" if json.load(sys.stdin).get("private") is True else "false")')
+          if [ "$repo_private" != "true" ]; then
+            echo "backup push stopped: destination repository is not confirmed private" >&2
+            exit 1
+          fi
+
+          bundle_dir="$RUNNER_TEMP/backup-bundles"
+          private_repo_dir="$RUNNER_TEMP/private-backup-repo"
+          askpass_file="$RUNNER_TEMP/backup-git-askpass.sh"
+          backup_url="https://github.com/${BACKUP_REPO}.git"
+          mkdir -p "$bundle_dir"
+
+          found=0
+          base_epoch=$(date -u -d '9 hours' +%s)
+          for i in -1 0 1 2 3 4 5 6; do
+            snapshot_date=$(date -u -d "@$((base_epoch - i * 86400))" +%Y%m%d)
+            raw_files=(data/raw/${snapshot_date}_*.json)
+            if [ -e "${raw_files[0]}" ]; then
+              tar -czf "$bundle_dir/${snapshot_date}.tar.gz" "${raw_files[@]}"
+              found=1
+            fi
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "backup push skipped: no raw files"
+            exit 0
+          fi
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'case "$1" in' \
+            '  *Username*) printf "%s\n" "x-access-token" ;;' \
+            '  *Password*) printf "%s\n" "$BACKUP_PUSH_TOKEN" ;;' \
+            '  *) exit 1 ;;' \
+            'esac' > "$askpass_file"
+          chmod 700 "$askpass_file"
+          export GIT_ASKPASS="$askpass_file"
+          export GIT_TERMINAL_PROMPT=0
+
+          git clone --depth 1 "$backup_url" "$private_repo_dir"
+
+          remote_url=$(git -C "$private_repo_dir" remote get-url origin)
+          if [ "$remote_url" != "$backup_url" ]; then
+            echo "backup push stopped: unexpected destination"
+            exit 1
+          fi
+
+          mkdir -p "$private_repo_dir/backups/daily"
+          cp "$bundle_dir"/*.tar.gz "$private_repo_dir/backups/daily/"
+          git -C "$private_repo_dir" config user.name "snapshot-bot"
+          git -C "$private_repo_dir" config user.email "actions@users.noreply.github.com"
+          git -C "$private_repo_dir" add -- backups/daily
+
+          if git -C "$private_repo_dir" diff --cached --quiet; then
+            echo "backup push skipped: no changes"
+            exit 0
+          fi
+
+          git -C "$private_repo_dir" commit \
+            -m "daily snapshot $(date -u -d '9 hours' +%Y%m%d)"
+          git -C "$private_repo_dir" pull --rebase
+          git -C "$private_repo_dir" push origin HEAD
+
+      - name: Report backup failure
+        if: ${{ steps.backup.outcome == 'failure' }}
+        run: |
+          echo "::warning title=Private backup failed::Backup was not pushed; review the backup step log."
+          {
+            echo "## Backup"
+            echo
+            echo "⚠️ Private backup push failed. Review the backup step log."
+          } >> "$GITHUB_STEP_SUMMARY"
