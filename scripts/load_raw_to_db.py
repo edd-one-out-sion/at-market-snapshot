@@ -21,6 +21,7 @@ VALIDATION_DIR = os.path.join(ROOT, "data", "validation")
 BATCH = 2000
 KST = timezone(timedelta(hours=9))
 AT_SOURCES = {"at-realtime", "at-origin"}
+LOAD_SUMMARY_PATH = os.path.join(RAW_DIR, "_load_summary.json")
 
 
 def _unquote(value):
@@ -40,6 +41,7 @@ def env():
         "SUPABASE_URL",
         "SUPABASE_SERVICE_KEY",
         "LOADER_DRY_RUN",
+        "PLANNED_ITEM_ZERO",
         "PLANNED_ORIGIN_REPLACE",
     ):
         if os.environ.get(key):
@@ -136,8 +138,8 @@ def fetch_load_source_for_market_date(iso_date, whsal_cd):
     return _market_load_source(rows)
 
 
-def fetch_origin_comparison_rows(iso_date, whsal_cd):
-    """origin 정보성 대조에 필요한 품목 코드와 가격만 전 페이지 읽는다."""
+def fetch_existing_rows_for_market_date(iso_date, whsal_cd):
+    """교체 보호와 origin 대조에 필요한 기존 행을 전 페이지 읽는다."""
     rows = []
     offset = 0
     page_size = 1000
@@ -155,6 +157,133 @@ def fetch_origin_comparison_rows(iso_date, whsal_cd):
             break
         offset += page_size
     return rows
+
+
+def _new_load_summary():
+    return {
+        "groups_expected": 0,
+        "ready": 0,
+        "incomplete": 0,
+        "skipped": 0,
+        "holds": 0,
+        "deleted_rows": 0,
+        "loaded_rows": 0,
+        "zero_row_runs": 0,
+    }
+
+
+def _write_load_summary(summary):
+    with open(LOAD_SUMMARY_PATH, "w", encoding="utf-8") as summary_file:
+        json.dump(summary, summary_file, ensure_ascii=False, indent=2)
+
+
+def _append_load_step_summary(summary):
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    with open(summary_path, "a", encoding="utf-8") as step_summary:
+        step_summary.write(
+            "\n## 적재 요약\n\n"
+            "| 항목 | 값 |\n"
+            "|---|---:|\n"
+            f"| 예상 날짜·시장 | {summary['groups_expected']} |\n"
+            f"| 완전 후보 | {summary['ready']} |\n"
+            f"| 불완전 후보 | {summary['incomplete']} |\n"
+            f"| 건너뜀 | {summary['skipped']} |\n"
+            f"| 교체 보류 | {summary['holds']} |\n"
+            f"| 삭제 행 | {summary['deleted_rows']} |\n"
+            f"| 적재 행 | {summary['loaded_rows']} |\n"
+            f"| 0행 실행 | {summary['zero_row_runs']} |\n"
+        )
+
+
+def evaluate_gate(capture_summary, load_summary):
+    errors = []
+    warnings = []
+    rows_by_source = capture_summary.get("rows_by_source") or {}
+    captured_rows = sum(
+        int(rows_by_source.get(source) or 0) for source in ("realtime", "origin")
+    )
+    loaded_rows = int(load_summary.get("loaded_rows") or 0)
+    ready = int(load_summary.get("ready") or 0)
+    incomplete = int(load_summary.get("incomplete") or 0)
+    holds = int(load_summary.get("holds") or 0)
+    stop_reason = capture_summary.get("stop_reason")
+
+    protected_by_hold = holds > 0 and ready == holds + int(
+        load_summary.get("skipped") or 0
+    )
+    if captured_rows > 0 and loaded_rows == 0 and not protected_by_hold:
+        errors.append(f"수집 {captured_rows}행을 받았지만 적재 행이 0입니다")
+    if stop_reason == "consecutive_failures":
+        errors.append("Capture 연속 실패 차단기가 발동했습니다")
+    if ready == 0 and incomplete > 0:
+        errors.append(f"완전 후보가 없고 불완전 날짜·시장이 {incomplete}개입니다")
+
+    if stop_reason == "time_budget":
+        warnings.append("Capture가 시간 예산으로 조기 종료되었습니다")
+    if holds > 0:
+        warnings.append(f"교체 보류 날짜·시장이 {holds}개입니다")
+    if captured_rows == 0 and loaded_rows == 0:
+        warnings.append("수집·적재 행이 모두 0입니다(휴장일 가능)")
+    if ready > 0 and incomplete > 0:
+        warnings.append(f"일부 불완전 날짜·시장이 {incomplete}개입니다")
+    return errors, warnings
+
+
+def run_gate(raw_dir=RAW_DIR):
+    summaries = {}
+    required = {
+        "capture": {
+            "expected_bundles",
+            "attempted",
+            "success",
+            "failed",
+            "unattempted",
+            "stop_reason",
+            "api_attempts",
+            "http_429_count",
+            "rows_by_source",
+        },
+        "load": {
+            "groups_expected",
+            "ready",
+            "incomplete",
+            "skipped",
+            "holds",
+            "deleted_rows",
+            "loaded_rows",
+            "zero_row_runs",
+        },
+    }
+    for name in ("capture", "load"):
+        path = os.path.join(raw_dir, f"_{name}_summary.json")
+        try:
+            with open(path, encoding="utf-8") as summary_file:
+                summary = json.load(summary_file)
+            if not isinstance(summary, dict):
+                raise ValueError("JSON object가 아닙니다")
+            missing = sorted(required[name] - set(summary))
+            if missing:
+                raise ValueError("필수 필드 누락: " + ", ".join(missing))
+            summaries[name] = summary
+        except Exception as error:  # noqa: BLE001 - Gate는 모든 읽기 실패를 표시한다
+            print(f"::error title=Snapshot gate::{name} 요약을 읽을 수 없습니다: {error}")
+            return 1
+
+    try:
+        errors, warnings = evaluate_gate(summaries["capture"], summaries["load"])
+    except Exception as error:  # noqa: BLE001 - 잘못된 계기판도 Gate 실패다
+        print(f"::error title=Snapshot gate::요약 값이 잘못되었습니다: {error}")
+        return 1
+    for warning in warnings:
+        print(f"::warning title=Snapshot gate::{warning}")
+    for error in errors:
+        print(f"::error title=Snapshot gate::{error}")
+    if errors:
+        return 1
+    print("Gate 통과: 수집·적재 요약에 실패 조건이 없습니다")
+    return 0
 
 
 def load_collection_item_keys():
@@ -470,6 +599,64 @@ def parse_origin_replace_keys(raw_value):
     return keys
 
 
+def parse_item_zero_keys(raw_value):
+    text = str(raw_value or "").strip()
+    if not text or text == "0":
+        return set()
+    if text.lower() in {"1", "true", "yes", "*"}:
+        raise RuntimeError(
+            "PLANNED_ITEM_ZERO는 YYYY-MM-DD:시장코드:large-mid 키만 허용합니다"
+        )
+    keys = set()
+    pattern = re.compile(
+        r"^(?P<date>\d{4}-\d{2}-\d{2}):(?P<market>\d+):"
+        r"(?P<large>\d+)-(?P<mid>\d+)$"
+    )
+    for token in text.split(","):
+        token = token.strip()
+        match = pattern.fullmatch(token)
+        if not match:
+            raise RuntimeError(f"PLANNED_ITEM_ZERO 키 형식 오류: {token}")
+        try:
+            datetime.strptime(match.group("date"), "%Y-%m-%d")
+        except ValueError as error:
+            raise RuntimeError(f"PLANNED_ITEM_ZERO 날짜 오류: {token}") from error
+        keys.add(token)
+    return keys
+
+
+def _item_zero_override_key(iso_date, whsal_cd, item_key):
+    return f"{iso_date}:{whsal_cd}:{item_key[0]}-{item_key[1]}"
+
+
+def find_unplanned_item_zeros(
+    existing_records,
+    candidate_records,
+    expected_items,
+    iso_date,
+    whsal_cd,
+    planned_item_zero_keys=None,
+):
+    """기존 행이 있지만 완전 후보에서 0행이 된 미승인 품목을 찾는다."""
+    before = _record_item_counts(existing_records)
+    after = _record_item_counts(candidate_records)
+    planned_item_zero_keys = planned_item_zero_keys or set()
+    held = []
+    for item_key in sorted(set(expected_items) & set(before)):
+        if before[item_key] <= 0 or after.get(item_key, 0) != 0:
+            continue
+        override_key = _item_zero_override_key(iso_date, whsal_cd, item_key)
+        if override_key not in planned_item_zero_keys:
+            held.append(
+                {
+                    "item": f"{item_key[0]}-{item_key[1]}",
+                    "existing": before[item_key],
+                    "override_key": override_key,
+                }
+            )
+    return held
+
+
 def _at_records(payloads):
     records = []
     corps = {}
@@ -569,6 +756,23 @@ def _record_noop_run(iso_date, whsal_cd, reported, message, dry_run=False):
     print(f"{iso_date} {whsal_cd}: [SKIP] {message}")
 
 
+def _record_partial_run(iso_date, whsal_cd, reported, message, dry_run=False):
+    if not dry_run:
+        now = utc_now_iso()
+        _post_run(
+            {
+                "started_at": now,
+                "finished_at": now,
+                "target_date": iso_date,
+                "whsal_cd": whsal_cd,
+                "status": "partial",
+                "rows_loaded": 0,
+                "total_cnt_reported": reported,
+                "error_msg": message,
+            }
+        )
+
+
 def _replace_market_date(
     iso_date, whsal_cd, records, corps, existing, source, advisory=None
 ):
@@ -653,8 +857,10 @@ def _at_load_payloads(
     only_date=None,
     dry_run=False,
     planned_origin_replace_keys=None,
+    planned_item_zero_keys=None,
     date_from=None,
     date_to=None,
+    summary=None,
 ):
     choices, incomplete = _prepare_at_choices(
         payloads,
@@ -663,11 +869,18 @@ def _at_load_payloads(
         date_from=date_from,
         date_to=date_to,
     )
+    initial_incomplete = list(incomplete)
+    summary = summary if summary is not None else _new_load_summary()
+    summary["groups_expected"] = len(choices) + len(initial_incomplete)
+    summary["ready"] = len(choices)
+    summary["incomplete"] = len(initial_incomplete)
     planned_origin_replace_keys = planned_origin_replace_keys or set()
+    planned_item_zero_keys = planned_item_zero_keys or set()
     existing_by_key = {}
     comparisons = []
     ready_choices = []
     skipped_choices = []
+    held_choices = []
     for choice in choices:
         iso_date = datetime.strptime(choice["date"], "%Y%m%d").date().isoformat()
         try:
@@ -677,8 +890,13 @@ def _at_load_payloads(
                 if existing > 0
                 else None
             )
+            existing_records = (
+                fetch_existing_rows_for_market_date(iso_date, choice["market"])
+                if existing > 0
+                else []
+            )
         except Exception as error:  # noqa: BLE001 - 이 날짜·시장만 보류한다
-            incomplete.append(
+            held_choices.append(
                 {
                     "date": choice["date"],
                     "market": choice["market"],
@@ -702,9 +920,34 @@ def _at_load_payloads(
                 }
             )
             continue
+
+        unplanned_zeros = find_unplanned_item_zeros(
+            existing_records,
+            choice["records"],
+            expected_items,
+            iso_date,
+            choice["market"],
+            planned_item_zero_keys,
+        )
+        if unplanned_zeros:
+            details = "; ".join(
+                f"{item['item']} 기존 {item['existing']}행, "
+                f"PLANNED_ITEM_ZERO={item['override_key']} 필요"
+                for item in unplanned_zeros
+            )
+            held_choices.append(
+                {
+                    "date": choice["date"],
+                    "market": choice["market"],
+                    "reported": len(choice["records"]),
+                    "problems": [f"success·0행 품목 교체 보류: {details}"],
+                    "item_zero": True,
+                }
+            )
+            continue
         if choice["source"] == "at-origin":
             if not choice["records"] and existing > 0:
-                incomplete.append(
+                held_choices.append(
                     {
                         "date": choice["date"],
                         "market": choice["market"],
@@ -722,7 +965,7 @@ def _at_load_payloads(
                 and len(choice["records"]) < existing
             )
             if needs_approval and approval_key not in planned_origin_replace_keys:
-                incomplete.append(
+                held_choices.append(
                     {
                         "date": choice["date"],
                         "market": choice["market"],
@@ -733,22 +976,6 @@ def _at_load_payloads(
                             f"신규 {len(choice['records'])}; "
                             f"PLANNED_ORIGIN_REPLACE={approval_key} 필요"
                         ],
-                    }
-                )
-                continue
-            try:
-                existing_records = (
-                    fetch_origin_comparison_rows(iso_date, choice["market"])
-                    if existing > 0
-                    else []
-                )
-            except Exception as error:  # noqa: BLE001 - 이 날짜·시장만 보류한다
-                incomplete.append(
-                    {
-                        "date": choice["date"],
-                        "market": choice["market"],
-                        "reported": len(choice["records"]),
-                        "problems": [f"origin 정보성 대조 조회 실패: {error}"],
                     }
                 )
                 continue
@@ -771,32 +998,44 @@ def _at_load_payloads(
             )
         ready_choices.append(choice)
     choices = ready_choices
+    summary["skipped"] = len(skipped_choices)
+    summary["holds"] = len(held_choices)
 
     report_path = None
     if comparisons:
         report_path = write_origin_report(comparisons)
 
     grand = 0
-    for failure in incomplete:
+    for failure in initial_incomplete:
         iso_date = datetime.strptime(failure["date"], "%Y%m%d").date().isoformat()
         message = "aT 교체 보류: " + ", ".join(
             failure["problems"] or ["완전한 source 없음"]
         )
-        if not dry_run:
-            now = utc_now_iso()
-            _post_run(
-                {
-                    "started_at": now,
-                    "finished_at": now,
-                    "target_date": iso_date,
-                    "whsal_cd": failure["market"],
-                    "status": "partial",
-                    "rows_loaded": 0,
-                    "total_cnt_reported": failure.get("reported", 0),
-                    "error_msg": message,
-                }
-            )
+        _record_partial_run(
+            iso_date,
+            failure["market"],
+            failure.get("reported", 0),
+            message,
+            dry_run=dry_run,
+        )
         print(f"{failure['date']} {failure['market']}: [WARN] {message}")
+        if not dry_run:
+            summary["zero_row_runs"] += 1
+
+    for held in held_choices:
+        iso_date = datetime.strptime(held["date"], "%Y%m%d").date().isoformat()
+        message = "aT 교체 보류: " + ", ".join(held["problems"])
+        _record_partial_run(
+            iso_date,
+            held["market"],
+            held.get("reported", 0),
+            message,
+            dry_run=dry_run,
+        )
+        label = "HOLD" if held.get("item_zero") else "WARN"
+        print(f"{held['date']} {held['market']}: [{label}] {message}")
+        if not dry_run:
+            summary["zero_row_runs"] += 1
 
     for skipped in skipped_choices:
         iso_date = datetime.strptime(skipped["date"], "%Y%m%d").date().isoformat()
@@ -807,6 +1046,8 @@ def _at_load_payloads(
             skipped["message"],
             dry_run=dry_run,
         )
+        if not dry_run:
+            summary["zero_row_runs"] += 1
 
     for choice in choices:
         iso_date = datetime.strptime(choice["date"], "%Y%m%d").date().isoformat()
@@ -818,7 +1059,7 @@ def _at_load_payloads(
             )
             grand += len(choice["records"])
             continue
-        grand += _replace_market_date(
+        loaded = _replace_market_date(
             iso_date,
             choice["market"],
             choice["records"],
@@ -827,6 +1068,12 @@ def _at_load_payloads(
             choice["source"],
             choice.get("note"),
         )
+        grand += loaded
+        summary["loaded_rows"] += loaded
+        if existing > 0 and choice["records"]:
+            summary["deleted_rows"] += existing
+        if loaded == 0:
+            summary["zero_row_runs"] += 1
     if report_path:
         print(f"origin 정보성 대조표: {report_path}")
     return grand
@@ -839,8 +1086,10 @@ def load_payloads(
     expected_items=None,
     dry_run=False,
     planned_origin_replace_keys=None,
+    planned_item_zero_keys=None,
     date_from=None,
     date_to=None,
+    summary=None,
 ):
     """aT v2 raw를 정산일 기준으로 검증하고 적재한다."""
     if not expected_items:
@@ -851,12 +1100,18 @@ def load_payloads(
         only_date=only_date,
         dry_run=dry_run,
         planned_origin_replace_keys=planned_origin_replace_keys,
+        planned_item_zero_keys=planned_item_zero_keys,
         date_from=date_from,
         date_to=date_to,
+        summary=summary,
     )
 
 
 def main():
+    if sys.argv[1:] == ["--gate"]:
+        raise SystemExit(run_gate())
+    if os.path.exists(LOAD_SUMMARY_PATH):
+        os.remove(LOAD_SUMMARY_PATH)
     configure()
     if len(sys.argv) > 3:
         raise RuntimeError(
@@ -865,22 +1120,32 @@ def main():
     only_date = sys.argv[1] if len(sys.argv) == 2 else None
     date_from = sys.argv[1] if len(sys.argv) == 3 else None
     date_to = sys.argv[2] if len(sys.argv) == 3 else None
-    files = sorted(glob.glob(os.path.join(RAW_DIR, "*.json")))
+    files = sorted(
+        path
+        for path in glob.glob(os.path.join(RAW_DIR, "*.json"))
+        if not os.path.basename(path).startswith("_")
+    )
     payloads = select_raw_payloads(files)
     dry_run = CONF.get("LOADER_DRY_RUN", "0").lower() in {"1", "true", "yes"}
     planned_origin_replace_keys = parse_origin_replace_keys(
         CONF.get("PLANNED_ORIGIN_REPLACE")
     )
+    planned_item_zero_keys = parse_item_zero_keys(CONF.get("PLANNED_ITEM_ZERO"))
     expected_items = load_collection_item_keys()
+    summary = _new_load_summary()
     grand = load_payloads(
         payloads,
         only_date=only_date,
         expected_items=expected_items,
         dry_run=dry_run,
         planned_origin_replace_keys=planned_origin_replace_keys,
+        planned_item_zero_keys=planned_item_zero_keys,
         date_from=date_from,
         date_to=date_to,
+        summary=summary,
     )
+    _write_load_summary(summary)
+    _append_load_step_summary(summary)
     prefix = "검증 완료" if dry_run else "완료"
     print(f"{prefix}: 총 {grand}건")
 

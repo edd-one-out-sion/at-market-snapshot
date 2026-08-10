@@ -49,12 +49,14 @@ jobs:
 
       - name: Load into Supabase
         env:
+          PLANNED_ITEM_ZERO: ${{ vars.PLANNED_ITEM_ZERO || '' }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python scripts/load_raw_to_db.py
 
       - name: Backup push to private repository
         id: backup
+        if: ${{ always() }}
         continue-on-error: true
         env:
           BACKUP_PUSH_TOKEN: ${{ secrets.BACKUP_PUSH_TOKEN }}
@@ -152,3 +154,7 @@ jobs:
             echo
             echo "⚠️ Private backup push failed. Review the backup step log."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate
+        if: ${{ always() }}
+        run: python scripts/load_raw_to_db.py --gate

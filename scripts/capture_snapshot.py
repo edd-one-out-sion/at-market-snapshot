@@ -23,6 +23,9 @@ AT_ENDPOINTS = {
 }
 AT_KEY_PARAMETER = "service" + "Key"
 TIME_BUDGET_ERROR = "시간 예산 초과"
+CAPTURE_SUMMARY_PATH = os.path.join(RAW_DIR, "_capture_summary.json")
+API_ATTEMPTS = 0
+HTTP_429_COUNT = 0
 
 
 class CaptureTimeBudgetExceeded(RuntimeError):
@@ -128,14 +131,21 @@ def load_collection_targets(config):
 
 
 def fetch(url, retries=3):
+    global API_ATTEMPTS, HTTP_429_COUNT  # noqa: PLW0603 - 실행 단위 계기판
     last_err = None
     for attempt in range(retries):
+        API_ATTEMPTS += 1
         try:
             request = urllib.request.Request(
                 url, headers={"User-Agent": "nongsanmul-collector/3.0"}
             )
             with urllib.request.urlopen(request, timeout=60) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                HTTP_429_COUNT += 1
+            last_err = error
+            time.sleep(2 * (attempt + 1))
         except Exception as error:  # noqa: BLE001 - 기록 후 재시도
             last_err = error
             time.sleep(2 * (attempt + 1))
@@ -321,7 +331,40 @@ def _payload(
     }
 
 
+def _write_capture_summary(summary):
+    with open(CAPTURE_SUMMARY_PATH, "w", encoding="utf-8") as summary_file:
+        json.dump(summary, summary_file, ensure_ascii=False, indent=2)
+
+
+def _append_capture_step_summary(summary):
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    rows = summary["rows_by_source"]
+    with open(summary_path, "a", encoding="utf-8") as step_summary:
+        step_summary.write(
+            "\n## 수집 요약\n\n"
+            "| 항목 | 값 |\n"
+            "|---|---:|\n"
+            f"| 예상 묶음 | {summary['expected_bundles']} |\n"
+            f"| 시도 | {summary['attempted']} |\n"
+            f"| 성공 | {summary['success']} |\n"
+            f"| 실패 | {summary['failed']} |\n"
+            f"| 미시도 | {summary['unattempted']} |\n"
+            f"| 중단 사유 | {summary['stop_reason'] or '-'} |\n"
+            f"| API HTTP 시도 | {summary['api_attempts']} |\n"
+            f"| HTTP 429 | {summary['http_429_count']} |\n"
+            f"| realtime 수신 행 | {rows['realtime']} |\n"
+            f"| origin 수신 행 | {rows['origin']} |\n"
+        )
+
+
 def main():
+    global API_ATTEMPTS, HTTP_429_COUNT  # noqa: PLW0603 - 실행 단위 초기화
+    API_ATTEMPTS = 0
+    HTTP_429_COUNT = 0
+    if os.path.exists(CAPTURE_SUMMARY_PATH):
+        os.remove(CAPTURE_SUMMARY_PATH)
     time_budget_seconds = _nonnegative_env_int("AT_TIME_BUDGET_SECONDS", 0)
     deadline = (
         time.monotonic() + time_budget_seconds if time_budget_seconds else None
@@ -340,6 +383,8 @@ def main():
     attempted_bundles = 0
     consecutive_failures = 0
     stop_reason = None
+    successful_bundles = 0
+    rows_by_source = {"realtime": 0, "origin": 0}
     total_bundles = sum(
         len(_capture_sources(config, day, today_kst)) for day in dates
     ) * len(markets) * len(items)
@@ -407,12 +452,14 @@ def main():
                                 )
                                 consecutive_failures += 1
                             else:
+                                successful_bundles += 1
                                 consecutive_failures = 0
                             log.write(
                                 f"{compact_date} {source} {market_name}({whsal_cd}) "
                                 f"{item_name}: {total}건, 수신 {len(rows)} ({status})\n"
                             )
                             day_rows += len(rows)
+                            rows_by_source[source] += len(rows)
                         except Exception as error:  # noqa: BLE001
                             time_budget_failed = isinstance(
                                 error, CaptureTimeBudgetExceeded
@@ -471,6 +518,19 @@ def main():
             f"=== 완료 {datetime.now(timezone.utc).isoformat(timespec='seconds')} "
             f"총 {grand_rows}건, 실패 {len(fails)}묶음 ===\n"
         )
+    summary = {
+        "expected_bundles": total_bundles,
+        "attempted": attempted_bundles,
+        "success": successful_bundles,
+        "failed": len(fails),
+        "unattempted": total_bundles - attempted_bundles,
+        "stop_reason": stop_reason,
+        "api_attempts": API_ATTEMPTS,
+        "http_429_count": HTTP_429_COUNT,
+        "rows_by_source": rows_by_source,
+    }
+    _write_capture_summary(summary)
+    _append_capture_step_summary(summary)
     if stop_reason is not None:
         stop_summary = _early_stop_summary(
             stop_reason, attempted_bundles, total_bundles
