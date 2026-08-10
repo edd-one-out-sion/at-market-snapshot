@@ -793,6 +793,23 @@ def _replace_market_date(
         )
         print(f"{iso_date} {whsal_cd}: [WARN] {message}")
         return {"deleted": 0, "inserted": 0}
+    if not records:
+        # 신규·기존 모두 0행(휴장일·미래일) — staging·RPC 호출 자체가 불필요하다
+        now = utc_now_iso()
+        _post_run(
+            {
+                "started_at": now,
+                "finished_at": now,
+                "target_date": iso_date,
+                "whsal_cd": whsal_cd,
+                "status": "success",
+                "rows_loaded": 0,
+                "total_cnt_reported": 0,
+                "error_msg": advisory,
+            }
+        )
+        print(f"{iso_date} {whsal_cd}: 신규·기존 모두 0행, 교체 생략")
+        return {"deleted": 0, "inserted": 0}
     if corps:
         req(
             "POST",
