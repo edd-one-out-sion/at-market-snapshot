@@ -792,7 +792,7 @@ def _replace_market_date(
             }
         )
         print(f"{iso_date} {whsal_cd}: [WARN] {message}")
-        return 0
+        return {"deleted": 0, "inserted": 0}
     if corps:
         req(
             "POST",
@@ -822,33 +822,113 @@ def _replace_market_date(
     for record in records:
         record["run_id"] = run_id
         record["load_source"] = source
-    if existing > 0:
-        req(
-            "DELETE",
-            f"/auction_records?sale_date=eq.{iso_date}&whsal_cd=eq.{whsal_cd}",
+
+    try:
+        for start in range(0, len(records), BATCH):
+            batch = records[start : start + BATCH]
+            if batch:
+                req(
+                    "POST",
+                    "/auction_records_staging",
+                    batch,
+                    prefer="return=minimal",
+                )
+        replace_result = req(
+            "POST",
+            "/rpc/replace_market_date_atomic",
+            {
+                "p_sale_date": iso_date,
+                "p_whsal_cd": whsal_cd,
+                "p_run_id": run_id,
+            },
         )
-    loaded = 0
-    for start in range(0, len(records), BATCH):
-        batch = records[start : start + BATCH]
-        if batch:
-            req("POST", "/auction_records", batch, prefer="return=minimal")
-            loaded += len(batch)
-    req(
-        "PATCH",
-        f"/collection_runs?id=eq.{run_id}",
-        {
-            "finished_at": utc_now_iso(),
-            "status": "success",
-            "rows_loaded": loaded,
-            "error_msg": advisory,
-        },
-        prefer="return=minimal",
+    except Exception as error:  # noqa: BLE001 - 실행 실패를 run에 남긴 뒤 전파한다
+        message = (
+            f"{source} staging/RPC 적재 실패: {error}; 기존 auction_records는 "
+            "변경되지 않았고 staging 잔재는 cleanup 대상입니다"
+        )
+        try:
+            req(
+                "PATCH",
+                f"/collection_runs?id=eq.{run_id}",
+                {
+                    "finished_at": utc_now_iso(),
+                    "status": "partial",
+                    "rows_loaded": 0,
+                    "error_msg": message,
+                },
+                prefer="return=minimal",
+            )
+        except Exception as patch_error:  # noqa: BLE001 - 원래 실패를 보존한다
+            message += f"; collection_runs 실패 기록도 실패: {patch_error}"
+        raise RuntimeError(message) from error
+
+    valid_counts = (
+        isinstance(replace_result, dict)
+        and isinstance(replace_result.get("deleted"), int)
+        and not isinstance(replace_result.get("deleted"), bool)
+        and replace_result["deleted"] >= 0
+        and isinstance(replace_result.get("inserted"), int)
+        and not isinstance(replace_result.get("inserted"), bool)
+        and replace_result["inserted"] >= 0
     )
+    replace_error = (
+        not valid_counts
+        or "error" in replace_result
+        or replace_result["inserted"] != len(records)
+    )
+    if replace_error:
+        returned = json.dumps(replace_result, ensure_ascii=False, default=str)
+        message = (
+            "원자 교체 RPC 반환 검증 실패: "
+            f"expected_inserted={len(records)}, returned={returned}; "
+            "RPC가 정상 반환되어 트랜잭션은 이미 커밋되었으므로 자동 복구하지 않습니다"
+        )
+        inserted = (
+            replace_result.get("inserted")
+            if isinstance(replace_result, dict)
+            and isinstance(replace_result.get("inserted"), int)
+            and not isinstance(replace_result.get("inserted"), bool)
+            and replace_result["inserted"] >= 0
+            else 0
+        )
+        req(
+            "PATCH",
+            f"/collection_runs?id=eq.{run_id}",
+            {
+                "finished_at": utc_now_iso(),
+                "status": "partial",
+                "rows_loaded": inserted,
+                "error_msg": message,
+            },
+            prefer="return=minimal",
+        )
+        raise RuntimeError(message)
+
+    deleted = replace_result["deleted"]
+    inserted = replace_result["inserted"]
+    try:
+        req(
+            "PATCH",
+            f"/collection_runs?id=eq.{run_id}",
+            {
+                "finished_at": utc_now_iso(),
+                "status": "success",
+                "rows_loaded": inserted,
+                "error_msg": advisory,
+            },
+            prefer="return=minimal",
+        )
+    except Exception as error:  # noqa: BLE001 - RPC 결과는 이미 커밋되었다
+        raise RuntimeError(
+            "원자 교체 RPC는 커밋되었지만 collection_runs 성공 기록에 실패했습니다; "
+            f"자동 복구하지 않습니다: {error}"
+        ) from error
     print(
-        f"{iso_date} {whsal_cd}: {loaded}건 정산일 적재 "
-        f"(source={source}, 기존 {existing} 교체)"
+        f"{iso_date} {whsal_cd}: {inserted}건 정산일 적재 "
+        f"(source={source}, RPC 삭제 {deleted})"
     )
-    return loaded
+    return {"deleted": deleted, "inserted": inserted}
 
 
 def _at_load_payloads(
@@ -1006,6 +1086,7 @@ def _at_load_payloads(
         report_path = write_origin_report(comparisons)
 
     grand = 0
+    load_errors = []
     for failure in initial_incomplete:
         iso_date = datetime.strptime(failure["date"], "%Y%m%d").date().isoformat()
         message = "aT 교체 보류: " + ", ".join(
@@ -1059,23 +1140,31 @@ def _at_load_payloads(
             )
             grand += len(choice["records"])
             continue
-        loaded = _replace_market_date(
-            iso_date,
-            choice["market"],
-            choice["records"],
-            choice["corps"],
-            existing,
-            choice["source"],
-            choice.get("note"),
-        )
-        grand += loaded
-        summary["loaded_rows"] += loaded
-        if existing > 0 and choice["records"]:
-            summary["deleted_rows"] += existing
-        if loaded == 0:
+        try:
+            replace_result = _replace_market_date(
+                iso_date,
+                choice["market"],
+                choice["records"],
+                choice["corps"],
+                existing,
+                choice["source"],
+                choice.get("note"),
+            )
+        except Exception as error:  # noqa: BLE001 - 다른 날짜·시장 적재는 계속한다
+            load_errors.append(f"{iso_date} {choice['market']}: {error}")
+            summary["zero_row_runs"] += 1
+            print(f"{iso_date} {choice['market']}: [ERROR] {error}")
+            continue
+        inserted = replace_result["inserted"]
+        grand += inserted
+        summary["loaded_rows"] += inserted
+        summary["deleted_rows"] += replace_result["deleted"]
+        if inserted == 0:
             summary["zero_row_runs"] += 1
     if report_path:
         print(f"origin 정보성 대조표: {report_path}")
+    if load_errors:
+        raise RuntimeError("날짜·시장 적재 실패: " + " | ".join(load_errors))
     return grand
 
 
@@ -1113,6 +1202,15 @@ def main():
     if os.path.exists(LOAD_SUMMARY_PATH):
         os.remove(LOAD_SUMMARY_PATH)
     configure()
+    try:
+        cleaned = req(
+            "POST",
+            "/rpc/cleanup_stale_staging",
+            {"p_hours": 24},
+        )
+        print(f"staging cleanup: {cleaned}건 삭제")
+    except Exception as error:  # noqa: BLE001 - cleanup 실패는 적재를 막지 않는다
+        print(f"::warning title=Staging cleanup::24시간 초과 행 정리 실패: {error}")
     if len(sys.argv) > 3:
         raise RuntimeError(
             "사용: load_raw_to_db.py [정산일 YYYYMMDD] 또는 [시작일 종료일]"
