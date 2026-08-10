@@ -9,7 +9,13 @@ on:
     - cron: '17 10 * * *'  # 19:17 KST
     - cron: '7 12 * * *'   # 21:07 KST
     - cron: '17 14 * * *'  # 23:17 KST
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      time_budget_seconds:
+        description: 'Capture time budget in seconds (blank uses 1200)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -32,6 +38,7 @@ jobs:
       - name: Capture settlement window
         env:
           AT_CAPTURE_SOURCES: ${{ vars.AT_CAPTURE_SOURCES || 'realtime,origin' }}
+          AT_TIME_BUDGET_SECONDS: ${{ github.event.inputs.time_budget_seconds || '1200' }}
           DATA_GO_KR_API_KEY_ENC: ${{ secrets.DATA_GO_KR_API_KEY_ENC }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

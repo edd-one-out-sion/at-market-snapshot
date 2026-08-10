@@ -22,6 +22,24 @@ AT_ENDPOINTS = {
     "origin": "https://apis.data.go.kr/B552845/katOrigin/trades",
 }
 AT_KEY_PARAMETER = "service" + "Key"
+TIME_BUDGET_ERROR = "시간 예산 초과"
+
+
+class CaptureTimeBudgetExceeded(RuntimeError):
+    """전체 수집 시간 예산이 끝났음을 상위 순회에 알린다."""
+
+
+def _nonnegative_env_int(name, default):
+    """환경변수를 0 이상의 정수로 읽고 잘못된 값은 기본값으로 돌린다."""
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _time_budget_exceeded(deadline):
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _unquote(value: str) -> str:
@@ -178,13 +196,17 @@ def _at_row_key(row):
     return tuple(str(row.get(field) or "") for field in fields)
 
 
-def capture_at_day_item(key, source, settlement_date, whsal_cd, large, mid):
+def capture_at_day_item(
+    key, source, settlement_date, whsal_cd, large, mid, deadline=None
+):
     """aT 신형 창구 한 묶음을 최대 1000행 페이지로 끝까지 수집한다."""
     rows = []
     seen = set()
     total = None
     page = 1
     while True:
+        if _time_budget_exceeded(deadline):
+            raise CaptureTimeBudgetExceeded(TIME_BUDGET_ERROR)
         url = build_at_url(
             key, source, settlement_date, whsal_cd, large, mid, page
         )
@@ -247,6 +269,23 @@ def _raw_path(compact_date, whsal_cd, large, mid, source):
     )
 
 
+def _capture_sources(config, day, today_kst):
+    sources = []
+    if "realtime" in config["AT_CAPTURE_SOURCES"]:
+        sources.append("realtime")
+    if "origin" in config["AT_CAPTURE_SOURCES"] and day < today_kst:
+        sources.append("origin")
+    return sources
+
+
+def _early_stop_summary(reason, attempted_bundles, total_bundles):
+    if reason == "time_budget":
+        prefix = "시간 예산 초과로 조기 종료"
+    else:
+        prefix = "연속 실패 차단기 발동"
+    return f"{prefix} — 시도 {attempted_bundles}/전체 {total_bundles}묶음"
+
+
 def _payload(
     *,
     compact_date,
@@ -283,6 +322,13 @@ def _payload(
 
 
 def main():
+    time_budget_seconds = _nonnegative_env_int("AT_TIME_BUDGET_SECONDS", 0)
+    deadline = (
+        time.monotonic() + time_budget_seconds if time_budget_seconds else None
+    )
+    max_consecutive_failures = _nonnegative_env_int(
+        "AT_MAX_CONSECUTIVE_FAILURES", 5
+    )
     config = load_config()
     items, markets = load_collection_targets(config)
     os.makedirs(RAW_DIR, exist_ok=True)
@@ -291,6 +337,12 @@ def main():
     log_path = os.path.join(RAW_DIR, "_capture_log.txt")
     grand_rows = 0
     fails = []
+    attempted_bundles = 0
+    consecutive_failures = 0
+    stop_reason = None
+    total_bundles = sum(
+        len(_capture_sources(config, day, today_kst)) for day in dates
+    ) * len(markets) * len(items)
 
     with open(log_path, "a", encoding="utf-8") as log:
         log.write(
@@ -302,15 +354,14 @@ def main():
             compact_date = day.strftime("%Y%m%d")
             settlement_date = day.isoformat()
             day_rows = 0
-            sources = []
-            if "realtime" in config["AT_CAPTURE_SOURCES"]:
-                sources.append("realtime")
-            if "origin" in config["AT_CAPTURE_SOURCES"] and day < today_kst:
-                sources.append("origin")
-            for source in sources:
+            for source in _capture_sources(config, day, today_kst):
                 api_key = config["DATA_GO_KR_API_KEY_ENC"]
                 for whsal_cd, market_name in markets:
                     for large, mid, item_name in items:
+                        if _time_budget_exceeded(deadline):
+                            stop_reason = "time_budget"
+                            break
+                        attempted_bundles += 1
                         payload_source = f"at-{source}"
                         output = _raw_path(
                             compact_date,
@@ -327,6 +378,7 @@ def main():
                                 whsal_cd,
                                 large,
                                 mid,
+                                deadline,
                             )
                             status = classify_capture(total, rows)
                             payload = _payload(
@@ -353,12 +405,18 @@ def main():
                                         f"API 보고 {total}, 수신 {len(rows)}",
                                     )
                                 )
+                                consecutive_failures += 1
+                            else:
+                                consecutive_failures = 0
                             log.write(
                                 f"{compact_date} {source} {market_name}({whsal_cd}) "
                                 f"{item_name}: {total}건, 수신 {len(rows)} ({status})\n"
                             )
                             day_rows += len(rows)
                         except Exception as error:  # noqa: BLE001
+                            time_budget_failed = isinstance(
+                                error, CaptureTimeBudgetExceeded
+                            )
                             payload = _payload(
                                 compact_date=compact_date,
                                 whsal_cd=whsal_cd,
@@ -370,7 +428,11 @@ def main():
                                 total=0,
                                 rows=[],
                                 status="failed",
-                                error="API 호출 실패",
+                                error=(
+                                    TIME_BUDGET_ERROR
+                                    if time_budget_failed
+                                    else "API 호출 실패"
+                                ),
                             )
                             with open(output, "w", encoding="utf-8") as raw_file:
                                 json.dump(payload, raw_file, ensure_ascii=False)
@@ -381,13 +443,45 @@ def main():
                                 f"{compact_date} {source} {market_name}({whsal_cd}) "
                                 f"{item_name}: 실패 — {error}\n"
                             )
+                            consecutive_failures += 1
+                            if time_budget_failed:
+                                stop_reason = "time_budget"
+                        if (
+                            stop_reason is None
+                            and max_consecutive_failures
+                            and consecutive_failures >= max_consecutive_failures
+                        ):
+                            stop_reason = "consecutive_failures"
+                        if stop_reason is not None:
+                            break
+                    if stop_reason is not None:
+                        break
+                if stop_reason is not None:
+                    break
             log.write(f"-- {compact_date} 소계 {day_rows}건\n")
             log.flush()
             grand_rows += day_rows
+            if stop_reason is not None:
+                break
+        if stop_reason is not None:
+            log.write(
+                f"=== {_early_stop_summary(stop_reason, attempted_bundles, total_bundles)} ===\n"
+            )
         log.write(
             f"=== 완료 {datetime.now(timezone.utc).isoformat(timespec='seconds')} "
             f"총 {grand_rows}건, 실패 {len(fails)}묶음 ===\n"
         )
+    if stop_reason is not None:
+        stop_summary = _early_stop_summary(
+            stop_reason, attempted_bundles, total_bundles
+        )
+        print(stop_summary)
+        warning_title = (
+            "Capture time budget exceeded"
+            if stop_reason == "time_budget"
+            else "Capture consecutive failure circuit breaker"
+        )
+        print(f"::warning title={warning_title}::{stop_summary}")
     print(f"완료: 총 {grand_rows}건 저장, 실패 {len(fails)}묶음")
     for failure in fails:
         print("실패:", failure)
