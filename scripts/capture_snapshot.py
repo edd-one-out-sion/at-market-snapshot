@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -30,6 +31,14 @@ HTTP_429_COUNT = 0
 
 class CaptureTimeBudgetExceeded(RuntimeError):
     """전체 수집 시간 예산이 끝났음을 상위 순회에 알린다."""
+
+
+class CaptureFetchFailed(RuntimeError):
+    """재시도 실패의 공개 가능한 종류를 상위 수집 루프에 전달한다."""
+
+    def __init__(self, message, *, all_attempts_timed_out):
+        super().__init__(message)
+        self.all_attempts_timed_out = all_attempts_timed_out
 
 
 def _nonnegative_env_int(name, default):
@@ -130,9 +139,25 @@ def load_collection_targets(config):
     )
 
 
+def _is_timeout_error(error):
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(error, urllib.error.URLError):
+        return _is_timeout_error(error.reason)
+    return False
+
+
+def _public_error_label(error):
+    if _is_timeout_error(error):
+        return "timeout"
+    if isinstance(error, urllib.error.HTTPError):
+        return f"HTTP {error.code}"
+    return type(error).__name__
+
+
 def fetch(url, retries=3):
     global API_ATTEMPTS, HTTP_429_COUNT  # noqa: PLW0603 - 실행 단위 계기판
-    last_err = None
+    errors = []
     for attempt in range(retries):
         API_ATTEMPTS += 1
         try:
@@ -144,12 +169,19 @@ def fetch(url, retries=3):
         except urllib.error.HTTPError as error:
             if error.code == 429:
                 HTTP_429_COUNT += 1
-            last_err = error
+            errors.append(error)
             time.sleep(2 * (attempt + 1))
         except Exception as error:  # noqa: BLE001 - 기록 후 재시도
-            last_err = error
+            errors.append(error)
             time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"3회 실패: {last_err}")
+    all_attempts_timed_out = bool(errors) and all(
+        _is_timeout_error(error) for error in errors
+    )
+    last_label = _public_error_label(errors[-1]) if errors else "unknown"
+    raise CaptureFetchFailed(
+        f"{retries}회 실패: {last_label}",
+        all_attempts_timed_out=all_attempts_timed_out,
+    )
 
 
 def build_at_url(encoded_key, source, settlement_date, whsal_cd, large, mid, page):
@@ -350,6 +382,8 @@ def _append_capture_step_summary(summary):
             f"| 시도 | {summary['attempted']} |\n"
             f"| 성공 | {summary['success']} |\n"
             f"| 실패 | {summary['failed']} |\n"
+            f"| timeout 실패 | {summary['timeout_failures']} |\n"
+            f"| 비-timeout 실패 | {summary['non_timeout_failures']} |\n"
             f"| 미시도 | {summary['unattempted']} |\n"
             f"| 중단 사유 | {summary['stop_reason'] or '-'} |\n"
             f"| API HTTP 시도 | {summary['api_attempts']} |\n"
@@ -384,6 +418,8 @@ def main():
     consecutive_failures = 0
     stop_reason = None
     successful_bundles = 0
+    timeout_failures = 0
+    non_timeout_failures = 0
     rows_by_source = {"realtime": 0, "origin": 0}
     total_bundles = sum(
         len(_capture_sources(config, day, today_kst)) for day in dates
@@ -441,6 +477,7 @@ def main():
                             with open(output, "w", encoding="utf-8") as raw_file:
                                 json.dump(payload, raw_file, ensure_ascii=False)
                             if status != "success":
+                                non_timeout_failures += 1
                                 fails.append(
                                     (
                                         compact_date,
@@ -464,6 +501,14 @@ def main():
                             time_budget_failed = isinstance(
                                 error, CaptureTimeBudgetExceeded
                             )
+                            timeout_failed = (
+                                isinstance(error, CaptureFetchFailed)
+                                and error.all_attempts_timed_out
+                            )
+                            if timeout_failed:
+                                timeout_failures += 1
+                            else:
+                                non_timeout_failures += 1
                             payload = _payload(
                                 compact_date=compact_date,
                                 whsal_cd=whsal_cd,
@@ -523,6 +568,8 @@ def main():
         "attempted": attempted_bundles,
         "success": successful_bundles,
         "failed": len(fails),
+        "timeout_failures": timeout_failures,
+        "non_timeout_failures": non_timeout_failures,
         "unattempted": total_bundles - attempted_bundles,
         "stop_reason": stop_reason,
         "api_attempts": API_ATTEMPTS,

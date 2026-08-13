@@ -4,11 +4,10 @@ on:
   schedule:
     - cron: '17 17 * * *'  # 02:17 KST
     - cron: '7 19 * * *'   # 04:07 KST
+    - cron: '17 20 * * *'  # 05:17 KST
     - cron: '7 22 * * *'   # 07:07 KST
     - cron: '7 3 * * *'    # 12:07 KST
-    - cron: '17 10 * * *'  # 19:17 KST
     - cron: '7 12 * * *'   # 21:07 KST
-    - cron: '17 14 * * *'  # 23:17 KST
   workflow_dispatch:
     inputs:
       time_budget_seconds:
@@ -49,6 +48,7 @@ jobs:
 
       - name: Load into Supabase
         env:
+          MORNING_BASELINE_REQUIRED: ${{ github.event_name == 'schedule' && (github.event.schedule == '17 20 * * *' || github.event.schedule == '7 22 * * *') }}
           PLANNED_ITEM_ZERO: ${{ vars.PLANNED_ITEM_ZERO || '' }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -157,4 +157,7 @@ jobs:
 
       - name: Gate
         if: ${{ always() }}
+        env:
+          BACKUP_OUTCOME: ${{ steps.backup.outcome }}
+          EXPECTED_TIMEOUT_DOWNGRADE: ${{ github.event_name == 'schedule' && contains(fromJSON('["17 17 * * *","7 19 * * *","17 20 * * *","7 22 * * *","7 12 * * *"]'), github.event.schedule) }}
         run: python scripts/load_raw_to_db.py --gate

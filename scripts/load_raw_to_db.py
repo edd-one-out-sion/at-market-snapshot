@@ -41,6 +41,9 @@ def env():
         "SUPABASE_URL",
         "SUPABASE_SERVICE_KEY",
         "LOADER_DRY_RUN",
+        "MORNING_BASELINE_REQUIRED",
+        "EXPECTED_TIMEOUT_DOWNGRADE",
+        "BACKUP_OUTCOME",
         "PLANNED_ITEM_ZERO",
         "PLANNED_ORIGIN_REPLACE",
     ):
@@ -169,6 +172,14 @@ def _new_load_summary():
         "deleted_rows": 0,
         "loaded_rows": 0,
         "zero_row_runs": 0,
+        "morning_baseline": {
+            "required": False,
+            "rule": "all_active_markets_strict",
+            "passed": True,
+            "expected_pairs": 0,
+            "actual_pairs": 0,
+            "targets": [],
+        },
     }
 
 
@@ -195,9 +206,79 @@ def _append_load_step_summary(summary):
             f"| 적재 행 | {summary['loaded_rows']} |\n"
             f"| 0행 실행 | {summary['zero_row_runs']} |\n"
         )
+        baseline = summary["morning_baseline"]
+        if baseline.get("required"):
+            step_summary.write(
+                "\n## 아침 기준선\n\n"
+                f"- 규칙: `{baseline['rule']}`\n"
+                f"- 시장·날짜 충족: {baseline['actual_pairs']}/"
+                f"{baseline['expected_pairs']}\n"
+                f"- 결과: {'통과' if baseline.get('passed') else '미달'}\n"
+            )
+            for target in baseline.get("targets") or []:
+                reason = target.get("closed_reason")
+                if reason:
+                    step_summary.write(
+                        f"- {target['date']} {target['source']}: 휴장({reason})\n"
+                    )
+                    continue
+                market_rows = ", ".join(
+                    f"{market['market']}={market['rows']}행"
+                    for market in target.get("markets") or []
+                )
+                step_summary.write(
+                    f"- {target['date']} {target['source']}: {market_rows}\n"
+                )
 
 
-def evaluate_gate(capture_summary, load_summary):
+def _truthy(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _expected_timeout_is_safe(capture_summary, load_summary):
+    rows_by_source = capture_summary.get("rows_by_source") or {}
+    captured_rows = sum(
+        int(rows_by_source.get(source) or 0) for source in ("realtime", "origin")
+    )
+    attempted = int(capture_summary.get("attempted") or 0)
+    failed = int(capture_summary.get("failed") or 0)
+    return (
+        capture_summary.get("stop_reason") == "consecutive_failures"
+        and attempted > 0
+        and failed == attempted
+        and int(capture_summary.get("success") or 0) == 0
+        and int(capture_summary.get("timeout_failures") or 0) == failed
+        and int(capture_summary.get("non_timeout_failures") or 0) == 0
+        and captured_rows == 0
+        and int(load_summary.get("ready") or 0) == 0
+        and int(load_summary.get("incomplete") or 0) > 0
+        and int(load_summary.get("skipped") or 0) == 0
+        and int(load_summary.get("holds") or 0) == 0
+        and int(load_summary.get("deleted_rows") or 0) == 0
+        and int(load_summary.get("loaded_rows") or 0) == 0
+    )
+
+
+def _baseline_missing_pairs(baseline):
+    missing = []
+    for target in baseline.get("targets") or []:
+        if target.get("closed_reason"):
+            continue
+        for market in target.get("markets") or []:
+            if not market.get("present"):
+                missing.append(
+                    f"{target['date']}:{market['market']}({target['source']})"
+                )
+    return missing
+
+
+def evaluate_gate(
+    capture_summary,
+    load_summary,
+    *,
+    allow_expected_timeout=False,
+    backup_outcome=None,
+):
     errors = []
     warnings = []
     rows_by_source = capture_summary.get("rows_by_source") or {}
@@ -209,22 +290,45 @@ def evaluate_gate(capture_summary, load_summary):
     incomplete = int(load_summary.get("incomplete") or 0)
     holds = int(load_summary.get("holds") or 0)
     stop_reason = capture_summary.get("stop_reason")
+    expected_timeout = allow_expected_timeout and _expected_timeout_is_safe(
+        capture_summary, load_summary
+    )
 
     protected_by_hold = holds > 0 and ready == holds + int(
         load_summary.get("skipped") or 0
     )
     if captured_rows > 0 and loaded_rows == 0 and not protected_by_hold:
         errors.append(f"수집 {captured_rows}행을 받았지만 적재 행이 0입니다")
-    if stop_reason == "consecutive_failures":
+    if stop_reason == "consecutive_failures" and not expected_timeout:
         errors.append("Capture 연속 실패 차단기가 발동했습니다")
-    if ready == 0 and incomplete > 0:
+    if ready == 0 and incomplete > 0 and not expected_timeout:
         errors.append(f"완전 후보가 없고 불완전 날짜·시장이 {incomplete}개입니다")
+    if expected_timeout:
+        warnings.append(
+            "API 전면 timeout 차단기 수집 0행이며 DB 삭제·적재 0행이라 "
+            "기존 데이터를 유지했습니다"
+        )
+
+    baseline = load_summary.get("morning_baseline") or {}
+    if baseline.get("required") and not baseline.get("passed"):
+        missing = _baseline_missing_pairs(baseline)
+        detail = ", ".join(missing) if missing else str(
+            baseline.get("error") or "판정 실패"
+        )
+        errors.append(
+            "아침 기준선 미달: "
+            f"{baseline.get('actual_pairs', 0)}/"
+            f"{baseline.get('expected_pairs', 0)}; {detail}"
+        )
+
+    if backup_outcome and backup_outcome != "success":
+        errors.append(f"비공개 백업 단계가 실패했습니다(outcome={backup_outcome})")
 
     if stop_reason == "time_budget":
         warnings.append("Capture가 시간 예산으로 조기 종료되었습니다")
     if holds > 0:
         warnings.append(f"교체 보류 날짜·시장이 {holds}개입니다")
-    if captured_rows == 0 and loaded_rows == 0:
+    if captured_rows == 0 and loaded_rows == 0 and not expected_timeout:
         warnings.append("수집·적재 행이 모두 0입니다(휴장일 가능)")
     if ready > 0 and incomplete > 0:
         warnings.append(f"일부 불완전 날짜·시장이 {incomplete}개입니다")
@@ -239,6 +343,8 @@ def run_gate(raw_dir=RAW_DIR):
             "attempted",
             "success",
             "failed",
+            "timeout_failures",
+            "non_timeout_failures",
             "unattempted",
             "stop_reason",
             "api_attempts",
@@ -254,6 +360,7 @@ def run_gate(raw_dir=RAW_DIR):
             "deleted_rows",
             "loaded_rows",
             "zero_row_runs",
+            "morning_baseline",
         },
     }
     for name in ("capture", "load"):
@@ -272,7 +379,12 @@ def run_gate(raw_dir=RAW_DIR):
             return 1
 
     try:
-        errors, warnings = evaluate_gate(summaries["capture"], summaries["load"])
+        errors, warnings = evaluate_gate(
+            summaries["capture"],
+            summaries["load"],
+            allow_expected_timeout=_truthy(CONF.get("EXPECTED_TIMEOUT_DOWNGRADE")),
+            backup_outcome=CONF.get("BACKUP_OUTCOME"),
+        )
     except Exception as error:  # noqa: BLE001 - 잘못된 계기판도 Gate 실패다
         print(f"::error title=Snapshot gate::요약 값이 잘못되었습니다: {error}")
         return 1
@@ -299,6 +411,139 @@ def load_collection_item_keys():
     if not keys or any(not large or not mid for large, mid in keys):
         raise RuntimeError("수집 품목 설정이 비었거나 코드가 잘못되었습니다")
     return keys
+
+
+def load_collection_market_codes():
+    rows = req(
+        "GET",
+        "/markets?select=whsal_cd&collect=eq.true&order=display_order.asc",
+    )
+    codes = [str(row.get("whsal_cd") or "") for row in rows or []]
+    if not codes or any(not code for code in codes) or len(codes) != len(set(codes)):
+        raise RuntimeError("수집 시장 설정이 비었거나 코드가 잘못되었습니다")
+    return codes
+
+
+def count_for_market_date_source(iso_date, whsal_cd, source):
+    """기준선용 정산일·시장·source 행수를 Content-Range로 확인한다."""
+    if source not in AT_SOURCES:
+        raise RuntimeError(f"기준선 source가 잘못되었습니다: {source}")
+    if BASE is None or HEADERS is None:
+        raise RuntimeError("Supabase 클라이언트가 설정되지 않았습니다")
+    headers = dict(HEADERS)
+    headers["Prefer"] = "count=exact"
+    headers["Range"] = "0-0"
+    path = (
+        f"{BASE}/auction_records?select=id&sale_date=eq.{iso_date}"
+        f"&whsal_cd=eq.{whsal_cd}&load_source=eq.{source}"
+    )
+    for attempt in range(3):
+        request = urllib.request.Request(path, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                content_range = response.headers.get("Content-Range", "*/0")
+                return int(content_range.split("/")[-1])
+        except Exception as error:  # noqa: BLE001 - 읽기 전용 재시도
+            if attempt == 2:
+                raise RuntimeError(
+                    "기준선 행수 조회 3회 실패: "
+                    f"{iso_date} {whsal_cd} {source}: {type(error).__name__}"
+                ) from error
+            time.sleep(2 * (attempt + 1))
+
+
+def _verified_zero_date(
+    payloads,
+    compact_date,
+    source,
+    market_codes,
+    expected_items,
+):
+    expected = {
+        (market, large, mid)
+        for market in market_codes
+        for large, mid in expected_items
+    }
+    observed = {}
+    for payload in payloads:
+        if str(payload.get("sale_date") or "") != compact_date:
+            continue
+        if _payload_source(payload) != source:
+            continue
+        key = (
+            str(payload.get("whsal_cd") or ""),
+            str(payload.get("large") or ""),
+            str(payload.get("mid") or ""),
+        )
+        observed[key] = payload
+    if set(observed) != expected:
+        return False
+    return all(
+        (payload.get("_capture_status") or capture_status(payload)) == "success"
+        and int(payload.get("total_cnt") or 0) == 0
+        and len(payload.get("rows") or []) == 0
+        for payload in observed.values()
+    )
+
+
+def evaluate_morning_baseline(
+    payloads,
+    expected_items,
+    market_codes,
+    *,
+    required,
+    now=None,
+):
+    result = {
+        "required": bool(required),
+        "rule": "all_active_markets_strict",
+        "passed": True,
+        "expected_pairs": 0,
+        "actual_pairs": 0,
+        "targets": [],
+    }
+    if not required:
+        return result
+
+    current = now or datetime.now(KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    today = current.astimezone(KST).date()
+    target_specs = (
+        (today, "at-realtime"),
+        (today - timedelta(days=1), "at-origin"),
+    )
+    for day, source in target_specs:
+        compact_date = day.strftime("%Y%m%d")
+        target = {
+            "date": day.isoformat(),
+            "source": source,
+            "closed_reason": None,
+            "markets": [],
+        }
+        if day.weekday() == 6:
+            target["closed_reason"] = "sunday"
+        elif _verified_zero_date(
+            payloads,
+            compact_date,
+            source,
+            market_codes,
+            expected_items,
+        ):
+            target["closed_reason"] = "api-success-zero"
+        else:
+            result["expected_pairs"] += len(market_codes)
+            for market in market_codes:
+                rows = count_for_market_date_source(day.isoformat(), market, source)
+                present = rows > 0
+                result["actual_pairs"] += int(present)
+                target["markets"].append(
+                    {"market": market, "rows": rows, "present": present}
+                )
+        result["targets"].append(target)
+
+    result["passed"] = result["actual_pairs"] == result["expected_pairs"]
+    return result
 
 
 def utc_now_iso():
@@ -1247,6 +1492,7 @@ def main():
     )
     planned_item_zero_keys = parse_item_zero_keys(CONF.get("PLANNED_ITEM_ZERO"))
     expected_items = load_collection_item_keys()
+    market_codes = load_collection_market_codes()
     summary = _new_load_summary()
     grand = load_payloads(
         payloads,
@@ -1259,6 +1505,24 @@ def main():
         date_to=date_to,
         summary=summary,
     )
+    baseline_required = _truthy(CONF.get("MORNING_BASELINE_REQUIRED"))
+    try:
+        summary["morning_baseline"] = evaluate_morning_baseline(
+            payloads,
+            expected_items,
+            market_codes,
+            required=baseline_required,
+        )
+    except Exception as error:  # noqa: BLE001 - Gate가 빨간불로 판정할 근거를 남긴다
+        summary["morning_baseline"] = {
+            "required": baseline_required,
+            "rule": "all_active_markets_strict",
+            "passed": False,
+            "expected_pairs": 0,
+            "actual_pairs": 0,
+            "targets": [],
+            "error": f"{type(error).__name__}: {error}",
+        }
     _write_load_summary(summary)
     _append_load_step_summary(summary)
     prefix = "검증 완료" if dry_run else "완료"
