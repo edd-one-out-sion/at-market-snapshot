@@ -22,6 +22,15 @@ BATCH = 2000
 KST = timezone(timedelta(hours=9))
 AT_SOURCES = {"at-realtime", "at-origin"}
 LOAD_SUMMARY_PATH = os.path.join(RAW_DIR, "_load_summary.json")
+MORNING_BASELINE_CRONS = {"17 20 * * *", "7 22 * * *"}
+KNOWN_SCHEDULE_CRONS = {
+    "17 17 * * *",
+    "7 19 * * *",
+    "17 20 * * *",
+    "7 22 * * *",
+    "7 3 * * *",
+    "7 12 * * *",
+}
 
 
 def _unquote(value):
@@ -41,9 +50,7 @@ def env():
         "SUPABASE_URL",
         "SUPABASE_SERVICE_KEY",
         "LOADER_DRY_RUN",
-        "MORNING_BASELINE_REQUIRED",
-        "EXPECTED_TIMEOUT_DOWNGRADE",
-        "BACKUP_OUTCOME",
+        "PLANNED_CLOSURE",
         "PLANNED_ITEM_ZERO",
         "PLANNED_ORIGIN_REPLACE",
     ):
@@ -216,23 +223,61 @@ def _append_load_step_summary(summary):
                 f"- 결과: {'통과' if baseline.get('passed') else '미달'}\n"
             )
             for target in baseline.get("targets") or []:
-                reason = target.get("closed_reason")
-                if reason:
-                    step_summary.write(
-                        f"- {target['date']} {target['source']}: 휴장({reason})\n"
-                    )
-                    continue
                 market_rows = ", ".join(
-                    f"{market['market']}={market['rows']}행"
+                    (
+                        f"{market['market']}=휴장({market['closed_reason']})"
+                        if market.get("closed_reason")
+                        else f"{market['market']}={market['rows']}행"
+                    )
                     for market in target.get("markets") or []
                 )
                 step_summary.write(
                     f"- {target['date']} {target['source']}: {market_rows}\n"
                 )
+                zero_markets = target.get("success_zero_markets") or []
+                if zero_markets:
+                    step_summary.write(
+                        "  - 참고: API 성공+0행 관측(휴장 면제 아님): "
+                        + ", ".join(zero_markets)
+                        + "\n"
+                    )
 
 
-def _truthy(value):
-    return str(value or "").strip().lower() in {"1", "true", "yes"}
+def morning_baseline_required(*, event_name=None, event_path=None, now=None):
+    """GitHub 이벤트 원문과 KST 시각으로 아침 기준선 무장 여부를 정한다."""
+    event_name = (
+        os.environ.get("GITHUB_EVENT_NAME", "")
+        if event_name is None
+        else str(event_name)
+    )
+    if event_name == "schedule":
+        event_path = (
+            os.environ.get("GITHUB_EVENT_PATH", "")
+            if event_path is None
+            else str(event_path)
+        )
+        if not event_path:
+            raise RuntimeError("schedule 이벤트의 GITHUB_EVENT_PATH가 없습니다")
+        try:
+            with open(event_path, encoding="utf-8") as event_file:
+                payload = json.load(event_file)
+        except Exception as error:  # noqa: BLE001 - 무장 정보 부재는 fail-closed
+            raise RuntimeError(
+                f"schedule 이벤트 payload를 읽을 수 없습니다: {type(error).__name__}"
+            ) from error
+        schedule = str(payload.get("schedule") or "")
+        if schedule not in KNOWN_SCHEDULE_CRONS:
+            raise RuntimeError(
+                f"등록되지 않은 schedule cron입니다: {schedule or '(없음)'}"
+            )
+        return schedule in MORNING_BASELINE_CRONS
+    if event_name == "workflow_dispatch":
+        current = now or datetime.now(KST)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=KST)
+        current = current.astimezone(KST)
+        return (current.hour, current.minute) >= (4, 30) and current.hour < 12
+    return False
 
 
 def _expected_timeout_is_safe(capture_summary, load_summary):
@@ -262,10 +307,8 @@ def _expected_timeout_is_safe(capture_summary, load_summary):
 def _baseline_missing_pairs(baseline):
     missing = []
     for target in baseline.get("targets") or []:
-        if target.get("closed_reason"):
-            continue
         for market in target.get("markets") or []:
-            if not market.get("present"):
+            if not market.get("closed_reason") and not market.get("present"):
                 missing.append(
                     f"{target['date']}:{market['market']}({target['source']})"
                 )
@@ -276,7 +319,6 @@ def evaluate_gate(
     capture_summary,
     load_summary,
     *,
-    allow_expected_timeout=False,
     backup_outcome=None,
 ):
     errors = []
@@ -290,9 +332,7 @@ def evaluate_gate(
     incomplete = int(load_summary.get("incomplete") or 0)
     holds = int(load_summary.get("holds") or 0)
     stop_reason = capture_summary.get("stop_reason")
-    expected_timeout = allow_expected_timeout and _expected_timeout_is_safe(
-        capture_summary, load_summary
-    )
+    expected_timeout = _expected_timeout_is_safe(capture_summary, load_summary)
 
     protected_by_hold = holds > 0 and ready == holds + int(
         load_summary.get("skipped") or 0
@@ -321,8 +361,11 @@ def evaluate_gate(
             f"{baseline.get('expected_pairs', 0)}; {detail}"
         )
 
-    if backup_outcome and backup_outcome != "success":
-        errors.append(f"비공개 백업 단계가 실패했습니다(outcome={backup_outcome})")
+    if backup_outcome != "success":
+        errors.append(
+            "비공개 백업 결과가 success가 아닙니다"
+            f"(outcome={backup_outcome or 'missing'})"
+        )
 
     if stop_reason == "time_budget":
         warnings.append("Capture가 시간 예산으로 조기 종료되었습니다")
@@ -382,8 +425,7 @@ def run_gate(raw_dir=RAW_DIR):
         errors, warnings = evaluate_gate(
             summaries["capture"],
             summaries["load"],
-            allow_expected_timeout=_truthy(CONF.get("EXPECTED_TIMEOUT_DOWNGRADE")),
-            backup_outcome=CONF.get("BACKUP_OUTCOME"),
+            backup_outcome=os.environ.get("BACKUP_OUTCOME"),
         )
     except Exception as error:  # noqa: BLE001 - 잘못된 계기판도 Gate 실패다
         print(f"::error title=Snapshot gate::요약 값이 잘못되었습니다: {error}")
@@ -452,38 +494,52 @@ def count_for_market_date_source(iso_date, whsal_cd, source):
             time.sleep(2 * (attempt + 1))
 
 
-def _verified_zero_date(
+def _success_zero_markets(
     payloads,
     compact_date,
     source,
     market_codes,
     expected_items,
 ):
-    expected = {
-        (market, large, mid)
-        for market in market_codes
-        for large, mid in expected_items
-    }
-    observed = {}
+    observed = {market: {} for market in market_codes}
     for payload in payloads:
         if str(payload.get("sale_date") or "") != compact_date:
             continue
         if _payload_source(payload) != source:
             continue
-        key = (
-            str(payload.get("whsal_cd") or ""),
+        market = str(payload.get("whsal_cd") or "")
+        if market not in observed:
+            continue
+        item_key = (
             str(payload.get("large") or ""),
             str(payload.get("mid") or ""),
         )
-        observed[key] = payload
-    if set(observed) != expected:
-        return False
-    return all(
-        (payload.get("_capture_status") or capture_status(payload)) == "success"
-        and int(payload.get("total_cnt") or 0) == 0
-        and len(payload.get("rows") or []) == 0
-        for payload in observed.values()
-    )
+        observed[market][item_key] = payload
+    zero_markets = []
+    for market in market_codes:
+        by_item = observed[market]
+        if set(by_item) != set(expected_items):
+            continue
+        if all(
+            (payload.get("_capture_status") or capture_status(payload)) == "success"
+            and int(payload.get("total_cnt") or 0) == 0
+            and len(payload.get("rows") or []) == 0
+            for payload in by_item.values()
+        ):
+            zero_markets.append(market)
+    return zero_markets
+
+
+def _planned_closure_reason(day, market, planned_closure_keys):
+    if day.weekday() == 6:
+        return "sunday"
+    date_key = day.isoformat()
+    if (
+        date_key in planned_closure_keys
+        or f"{date_key}:{market}" in planned_closure_keys
+    ):
+        return "planned-closure"
+    return None
 
 
 def evaluate_morning_baseline(
@@ -492,6 +548,7 @@ def evaluate_morning_baseline(
     market_codes,
     *,
     required,
+    planned_closure_keys=None,
     now=None,
 ):
     result = {
@@ -504,6 +561,7 @@ def evaluate_morning_baseline(
     }
     if not required:
         return result
+    planned_closure_keys = planned_closure_keys or set()
 
     current = now or datetime.now(KST)
     if current.tzinfo is None:
@@ -518,28 +576,41 @@ def evaluate_morning_baseline(
         target = {
             "date": day.isoformat(),
             "source": source,
-            "closed_reason": None,
+            "success_zero_markets": _success_zero_markets(
+                payloads,
+                compact_date,
+                source,
+                market_codes,
+                expected_items,
+            ),
             "markets": [],
         }
-        if day.weekday() == 6:
-            target["closed_reason"] = "sunday"
-        elif _verified_zero_date(
-            payloads,
-            compact_date,
-            source,
-            market_codes,
-            expected_items,
-        ):
-            target["closed_reason"] = "api-success-zero"
-        else:
-            result["expected_pairs"] += len(market_codes)
-            for market in market_codes:
-                rows = count_for_market_date_source(day.isoformat(), market, source)
-                present = rows > 0
-                result["actual_pairs"] += int(present)
+        for market in market_codes:
+            closed_reason = _planned_closure_reason(
+                day, market, planned_closure_keys
+            )
+            if closed_reason:
                 target["markets"].append(
-                    {"market": market, "rows": rows, "present": present}
+                    {
+                        "market": market,
+                        "rows": 0,
+                        "present": True,
+                        "closed_reason": closed_reason,
+                    }
                 )
+                continue
+            result["expected_pairs"] += 1
+            rows = count_for_market_date_source(day.isoformat(), market, source)
+            present = rows > 0
+            result["actual_pairs"] += int(present)
+            target["markets"].append(
+                {
+                    "market": market,
+                    "rows": rows,
+                    "present": present,
+                    "closed_reason": None,
+                }
+            )
         result["targets"].append(target)
 
     result["passed"] = result["actual_pairs"] == result["expected_pairs"]
@@ -841,6 +912,27 @@ def parse_origin_replace_keys(raw_value):
                 f"PLANNED_ORIGIN_REPLACE 시장 코드 오류: {token}"
             )
         keys.add(f"{date_text}:{market}")
+    return keys
+
+
+def parse_planned_closure_keys(raw_value):
+    text = str(raw_value or "").strip()
+    if not text:
+        return set()
+    keys = set()
+    pattern = re.compile(
+        r"^(?P<date>\d{4}-\d{2}-\d{2})(?::(?P<market>\d+))?$"
+    )
+    for token in text.split(","):
+        token = token.strip()
+        match = pattern.fullmatch(token)
+        if not match:
+            raise RuntimeError(f"PLANNED_CLOSURE 키 형식 오류: {token}")
+        try:
+            datetime.strptime(match.group("date"), "%Y-%m-%d")
+        except ValueError as error:
+            raise RuntimeError(f"PLANNED_CLOSURE 날짜 오류: {token}") from error
+        keys.add(token)
     return keys
 
 
@@ -1490,6 +1582,9 @@ def main():
     planned_origin_replace_keys = parse_origin_replace_keys(
         CONF.get("PLANNED_ORIGIN_REPLACE")
     )
+    planned_closure_keys = parse_planned_closure_keys(
+        CONF.get("PLANNED_CLOSURE")
+    )
     planned_item_zero_keys = parse_item_zero_keys(CONF.get("PLANNED_ITEM_ZERO"))
     expected_items = load_collection_item_keys()
     market_codes = load_collection_market_codes()
@@ -1505,17 +1600,19 @@ def main():
         date_to=date_to,
         summary=summary,
     )
-    baseline_required = _truthy(CONF.get("MORNING_BASELINE_REQUIRED"))
+    baseline_required = False
     try:
+        baseline_required = morning_baseline_required()
         summary["morning_baseline"] = evaluate_morning_baseline(
             payloads,
             expected_items,
             market_codes,
             required=baseline_required,
+            planned_closure_keys=planned_closure_keys,
         )
     except Exception as error:  # noqa: BLE001 - Gate가 빨간불로 판정할 근거를 남긴다
         summary["morning_baseline"] = {
-            "required": baseline_required,
+            "required": True,
             "rule": "all_active_markets_strict",
             "passed": False,
             "expected_pairs": 0,

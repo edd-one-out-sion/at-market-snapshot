@@ -48,7 +48,7 @@ jobs:
 
       - name: Load into Supabase
         env:
-          MORNING_BASELINE_REQUIRED: ${{ github.event_name == 'schedule' && (github.event.schedule == '17 20 * * *' || github.event.schedule == '7 22 * * *') }}
+          PLANNED_CLOSURE: ${{ vars.PLANNED_CLOSURE || '' }}
           PLANNED_ITEM_ZERO: ${{ vars.PLANNED_ITEM_ZERO || '' }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -159,5 +159,4 @@ jobs:
         if: ${{ always() }}
         env:
           BACKUP_OUTCOME: ${{ steps.backup.outcome }}
-          EXPECTED_TIMEOUT_DOWNGRADE: ${{ github.event_name == 'schedule' && contains(fromJSON('["17 17 * * *","7 19 * * *","17 20 * * *","7 22 * * *","7 12 * * *"]'), github.event.schedule) }}
         run: python scripts/load_raw_to_db.py --gate
