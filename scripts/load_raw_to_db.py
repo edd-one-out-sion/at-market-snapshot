@@ -23,6 +23,10 @@ KST = timezone(timedelta(hours=9))
 AT_SOURCES = {"at-realtime", "at-origin"}
 LOAD_SUMMARY_PATH = os.path.join(RAW_DIR, "_load_summary.json")
 MORNING_BASELINE_CRONS = {"17 20 * * *", "7 22 * * *"}
+MORNING_BASELINE_CRON_MODES = {
+    "17 20 * * *": "today-realtime",
+    "7 22 * * *": "full",
+}
 KNOWN_SCHEDULE_CRONS = {
     "17 17 * * *",
     "7 19 * * *",
@@ -31,6 +35,8 @@ KNOWN_SCHEDULE_CRONS = {
     "7 3 * * *",
     "7 12 * * *",
 }
+assert MORNING_BASELINE_CRONS <= KNOWN_SCHEDULE_CRONS
+assert set(MORNING_BASELINE_CRON_MODES) == MORNING_BASELINE_CRONS
 
 
 def _unquote(value):
@@ -179,8 +185,10 @@ def _new_load_summary():
         "deleted_rows": 0,
         "loaded_rows": 0,
         "zero_row_runs": 0,
+        "planned_closure_warnings": [],
         "morning_baseline": {
             "required": False,
+            "mode": None,
             "rule": "all_active_markets_strict",
             "passed": True,
             "expected_pairs": 0,
@@ -213,16 +221,26 @@ def _append_load_step_summary(summary):
             f"| 적재 행 | {summary['loaded_rows']} |\n"
             f"| 0행 실행 | {summary['zero_row_runs']} |\n"
         )
+        for warning in summary.get("planned_closure_warnings") or []:
+            step_summary.write(f"- 경고: {warning}\n")
         baseline = summary["morning_baseline"]
         if baseline.get("required"):
+            if (
+                int(baseline.get("expected_pairs") or 0) == 0
+                and baseline.get("passed")
+            ):
+                result_label = "면제(검사 0건)"
+            else:
+                result_label = "통과" if baseline.get("passed") else "미달"
             step_summary.write(
                 "\n## 아침 기준선\n\n"
                 f"- 규칙: `{baseline['rule']}`\n"
                 f"- 시장·날짜 충족: {baseline['actual_pairs']}/"
                 f"{baseline['expected_pairs']}\n"
-                f"- 결과: {'통과' if baseline.get('passed') else '미달'}\n"
+                f"- 결과: {result_label}\n"
             )
             for target in baseline.get("targets") or []:
+                target_role = "필수" if target.get("required") else "참고"
                 market_rows = ", ".join(
                     (
                         f"{market['market']}=휴장({market['closed_reason']})"
@@ -232,7 +250,8 @@ def _append_load_step_summary(summary):
                     for market in target.get("markets") or []
                 )
                 step_summary.write(
-                    f"- {target['date']} {target['source']}: {market_rows}\n"
+                    f"- [{target_role}] {target['date']} {target['source']}: "
+                    f"{market_rows}\n"
                 )
                 zero_markets = target.get("success_zero_markets") or []
                 if zero_markets:
@@ -243,8 +262,8 @@ def _append_load_step_summary(summary):
                     )
 
 
-def morning_baseline_required(*, event_name=None, event_path=None, now=None):
-    """GitHub 이벤트 원문과 KST 시각으로 아침 기준선 무장 여부를 정한다."""
+def morning_baseline_mode(*, event_name=None, event_path=None, now=None):
+    """GitHub 이벤트 원문과 KST 시각으로 아침 기준선 역할을 정한다."""
     event_name = (
         os.environ.get("GITHUB_EVENT_NAME", "")
         if event_name is None
@@ -265,19 +284,33 @@ def morning_baseline_required(*, event_name=None, event_path=None, now=None):
             raise RuntimeError(
                 f"schedule 이벤트 payload를 읽을 수 없습니다: {type(error).__name__}"
             ) from error
+        if not isinstance(payload, dict):
+            raise RuntimeError("schedule 이벤트 payload가 JSON object가 아닙니다")
         schedule = str(payload.get("schedule") or "")
         if schedule not in KNOWN_SCHEDULE_CRONS:
             raise RuntimeError(
                 f"등록되지 않은 schedule cron입니다: {schedule or '(없음)'}"
             )
-        return schedule in MORNING_BASELINE_CRONS
+        return MORNING_BASELINE_CRON_MODES.get(schedule)
     if event_name == "workflow_dispatch":
         current = now or datetime.now(KST)
         if current.tzinfo is None:
             current = current.replace(tzinfo=KST)
         current = current.astimezone(KST)
-        return (current.hour, current.minute) >= (4, 30) and current.hour < 12
-    return False
+        if (current.hour, current.minute) >= (4, 30) and current.hour < 12:
+            return "full"
+    return None
+
+
+def morning_baseline_required(*, event_name=None, event_path=None, now=None):
+    """호환용 bool 판정. 실제 역할은 morning_baseline_mode가 정한다."""
+    return bool(
+        morning_baseline_mode(
+            event_name=event_name,
+            event_path=event_path,
+            now=now,
+        )
+    )
 
 
 def _expected_timeout_is_safe(capture_summary, load_summary):
@@ -307,6 +340,21 @@ def _expected_timeout_is_safe(capture_summary, load_summary):
 def _baseline_missing_pairs(baseline):
     missing = []
     for target in baseline.get("targets") or []:
+        if not target.get("required", True):
+            continue
+        for market in target.get("markets") or []:
+            if not market.get("closed_reason") and not market.get("present"):
+                missing.append(
+                    f"{target['date']}:{market['market']}({target['source']})"
+                )
+    return missing
+
+
+def _baseline_advisory_missing_pairs(baseline):
+    missing = []
+    for target in baseline.get("targets") or []:
+        if target.get("required", True):
+            continue
         for market in target.get("markets") or []:
             if not market.get("closed_reason") and not market.get("present"):
                 missing.append(
@@ -360,6 +408,15 @@ def evaluate_gate(
             f"{baseline.get('actual_pairs', 0)}/"
             f"{baseline.get('expected_pairs', 0)}; {detail}"
         )
+    if baseline.get("required"):
+        advisory_missing = _baseline_advisory_missing_pairs(baseline)
+        if advisory_missing:
+            warnings.append(
+                "아침 참고 기준 미달: " + ", ".join(advisory_missing)
+            )
+
+    for warning in load_summary.get("planned_closure_warnings") or []:
+        warnings.append(warning)
 
     if backup_outcome != "success":
         errors.append(
@@ -403,6 +460,7 @@ def run_gate(raw_dir=RAW_DIR):
             "deleted_rows",
             "loaded_rows",
             "zero_row_runs",
+            "planned_closure_warnings",
             "morning_baseline",
         },
     }
@@ -548,18 +606,28 @@ def evaluate_morning_baseline(
     market_codes,
     *,
     required,
+    mode=None,
     planned_closure_keys=None,
     now=None,
 ):
+    if mode is None and required:
+        mode = "full"
+    if mode not in {None, "today-realtime", "full"}:
+        raise RuntimeError(f"아침 기준선 mode가 잘못되었습니다: {mode}")
     result = {
-        "required": bool(required),
-        "rule": "all_active_markets_strict",
+        "required": bool(mode),
+        "mode": mode,
+        "rule": (
+            "today_realtime_strict_d1_origin_warning"
+            if mode == "today-realtime"
+            else "all_active_markets_strict"
+        ),
         "passed": True,
         "expected_pairs": 0,
         "actual_pairs": 0,
         "targets": [],
     }
-    if not required:
+    if not mode:
         return result
     planned_closure_keys = planned_closure_keys or set()
 
@@ -568,14 +636,15 @@ def evaluate_morning_baseline(
         current = current.replace(tzinfo=KST)
     today = current.astimezone(KST).date()
     target_specs = (
-        (today, "at-realtime"),
-        (today - timedelta(days=1), "at-origin"),
+        (today, "at-realtime", True),
+        (today - timedelta(days=1), "at-origin", mode == "full"),
     )
-    for day, source in target_specs:
+    for day, source, target_required in target_specs:
         compact_date = day.strftime("%Y%m%d")
         target = {
             "date": day.isoformat(),
             "source": source,
+            "required": target_required,
             "success_zero_markets": _success_zero_markets(
                 payloads,
                 compact_date,
@@ -593,16 +662,18 @@ def evaluate_morning_baseline(
                 target["markets"].append(
                     {
                         "market": market,
-                        "rows": 0,
-                        "present": True,
+                        "rows": None,
+                        "present": None,
                         "closed_reason": closed_reason,
                     }
                 )
                 continue
-            result["expected_pairs"] += 1
+            if target_required:
+                result["expected_pairs"] += 1
             rows = count_for_market_date_source(day.isoformat(), market, source)
             present = rows > 0
-            result["actual_pairs"] += int(present)
+            if target_required:
+                result["actual_pairs"] += int(present)
             target["markets"].append(
                 {
                     "market": market,
@@ -915,23 +986,56 @@ def parse_origin_replace_keys(raw_value):
     return keys
 
 
-def parse_planned_closure_keys(raw_value):
-    text = str(raw_value or "").strip()
-    if not text:
+def parse_planned_closure_keys(
+    raw_value,
+    *,
+    active_market_codes=None,
+    warnings=None,
+):
+    """잘못된 운영 변수는 건너뛰고 경고만 남긴다."""
+    warnings = warnings if warnings is not None else []
+    try:
+        text = str(raw_value or "").strip()
+    except Exception as error:  # noqa: BLE001 - 운영 변수 오타는 수집을 막지 않는다
+        warnings.append(
+            "PLANNED_CLOSURE 값을 읽지 못해 전체를 무시했습니다: "
+            f"{type(error).__name__}"
+        )
         return set()
+    if not text or text == "0":
+        return set()
+    active_market_codes = (
+        {str(code) for code in active_market_codes}
+        if active_market_codes is not None
+        else None
+    )
     keys = set()
     pattern = re.compile(
         r"^(?P<date>\d{4}-\d{2}-\d{2})(?::(?P<market>\d+))?$"
     )
     for token in text.split(","):
         token = token.strip()
+        if not token:
+            continue
         match = pattern.fullmatch(token)
         if not match:
-            raise RuntimeError(f"PLANNED_CLOSURE 키 형식 오류: {token}")
+            warnings.append(f"PLANNED_CLOSURE 형식 오류 토큰 무시: {token}")
+            continue
         try:
             datetime.strptime(match.group("date"), "%Y-%m-%d")
-        except ValueError as error:
-            raise RuntimeError(f"PLANNED_CLOSURE 날짜 오류: {token}") from error
+        except (TypeError, ValueError):
+            warnings.append(f"PLANNED_CLOSURE 날짜 오류 토큰 무시: {token}")
+            continue
+        market = match.group("market")
+        if (
+            market is not None
+            and active_market_codes is not None
+            and market not in active_market_codes
+        ):
+            warnings.append(
+                "PLANNED_CLOSURE 비활성 시장 토큰 무시: " + token
+            )
+            continue
         keys.add(token)
     return keys
 
@@ -1582,13 +1686,15 @@ def main():
     planned_origin_replace_keys = parse_origin_replace_keys(
         CONF.get("PLANNED_ORIGIN_REPLACE")
     )
-    planned_closure_keys = parse_planned_closure_keys(
-        CONF.get("PLANNED_CLOSURE")
-    )
     planned_item_zero_keys = parse_item_zero_keys(CONF.get("PLANNED_ITEM_ZERO"))
     expected_items = load_collection_item_keys()
     market_codes = load_collection_market_codes()
     summary = _new_load_summary()
+    planned_closure_keys = parse_planned_closure_keys(
+        CONF.get("PLANNED_CLOSURE"),
+        active_market_codes=market_codes,
+        warnings=summary["planned_closure_warnings"],
+    )
     grand = load_payloads(
         payloads,
         only_date=only_date,
@@ -1600,19 +1706,21 @@ def main():
         date_to=date_to,
         summary=summary,
     )
-    baseline_required = False
+    baseline_mode = None
     try:
-        baseline_required = morning_baseline_required()
+        baseline_mode = morning_baseline_mode()
         summary["morning_baseline"] = evaluate_morning_baseline(
             payloads,
             expected_items,
             market_codes,
-            required=baseline_required,
+            required=bool(baseline_mode),
+            mode=baseline_mode,
             planned_closure_keys=planned_closure_keys,
         )
     except Exception as error:  # noqa: BLE001 - Gate가 빨간불로 판정할 근거를 남긴다
         summary["morning_baseline"] = {
             "required": True,
+            "mode": baseline_mode,
             "rule": "all_active_markets_strict",
             "passed": False,
             "expected_pairs": 0,
