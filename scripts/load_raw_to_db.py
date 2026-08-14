@@ -27,6 +27,8 @@ MORNING_BASELINE_CRON_MODES = {
     "17 20 * * *": "today-realtime",
     "7 22 * * *": "full",
 }
+# 2026-08-14 첫 05:17 실측: 인천은 경매 중이므로 새벽에는 가락만 필수다.
+DAWN_REQUIRED_MARKETS = {"110001"}
 KNOWN_SCHEDULE_CRONS = {
     "17 17 * * *",
     "7 19 * * *",
@@ -618,7 +620,7 @@ def evaluate_morning_baseline(
         "required": bool(mode),
         "mode": mode,
         "rule": (
-            "today_realtime_strict_d1_origin_warning"
+            "dawn_required_markets_today_realtime_strict_others_warning"
             if mode == "today-realtime"
             else "all_active_markets_strict"
         ),
@@ -635,11 +637,36 @@ def evaluate_morning_baseline(
     if current.tzinfo is None:
         current = current.replace(tzinfo=KST)
     today = current.astimezone(KST).date()
-    target_specs = (
-        (today, "at-realtime", True),
-        (today - timedelta(days=1), "at-origin", mode == "full"),
-    )
-    for day, source, target_required in target_specs:
+    if mode == "today-realtime":
+        target_specs = (
+            (
+                today,
+                "at-realtime",
+                True,
+                [
+                    market
+                    for market in market_codes
+                    if market in DAWN_REQUIRED_MARKETS
+                ],
+            ),
+            (
+                today,
+                "at-realtime",
+                False,
+                [
+                    market
+                    for market in market_codes
+                    if market not in DAWN_REQUIRED_MARKETS
+                ],
+            ),
+            (today - timedelta(days=1), "at-origin", False, market_codes),
+        )
+    else:
+        target_specs = (
+            (today, "at-realtime", True, market_codes),
+            (today - timedelta(days=1), "at-origin", True, market_codes),
+        )
+    for day, source, target_required, target_market_codes in target_specs:
         compact_date = day.strftime("%Y%m%d")
         target = {
             "date": day.isoformat(),
@@ -649,12 +676,12 @@ def evaluate_morning_baseline(
                 payloads,
                 compact_date,
                 source,
-                market_codes,
+                target_market_codes,
                 expected_items,
             ),
             "markets": [],
         }
-        for market in market_codes:
+        for market in target_market_codes:
             closed_reason = _planned_closure_reason(
                 day, market, planned_closure_keys
             )
